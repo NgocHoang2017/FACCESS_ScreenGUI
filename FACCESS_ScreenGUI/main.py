@@ -96,8 +96,9 @@ def send_serial_response(ser, message):
         logging.debug("Status: 0x%02x", message)
     except Exception as e:
         logging.error("Error sending response via serial: %s", e)
-        
-def capture_and_save_image(frame):
+ 
+ 
+def detect_crop_face(frame):
     # Convert frame to grayscale
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     # Detect faces
@@ -117,6 +118,13 @@ def capture_and_save_image(frame):
         _, buffer = cv2.imencode('.jpg', cropped_face)
         binary_image = buffer.tobytes()
         
+        return binary_image
+    else:
+        logging.warning("No face detected!")
+       
+def capture_and_save_image(frame):
+    
+        binary_image = detect_crop_face(frame)
         # Save the image to SQLite database
         try:
             conn = sqlite3.connect('face.db')
@@ -126,14 +134,16 @@ def capture_and_save_image(frame):
             conn.commit()
             logging.debug("Image inserted into database successfully!")
             show_message_box("Success", "Image captured successfully")
+            
+            
+            return 
         except sqlite3.Error as e:
             logging.error("Error inserting image into database: %s", e)
             show_message_box("Error", "Error capturing image")
         finally:
             if conn:
                 conn.close()
-    else:
-        logging.warning("No face detected!")
+    
 
 def show_message_box(title, message, icon=QMessageBox.Information):
     msg = QMessageBox()
@@ -159,7 +169,7 @@ def process_request(request, client_socket):
             camera_widget.capture_image = True
             image_data = None
             if frame is not None:
-                image_data = cv2.imencode('.jpg', frame)[1].tobytes()
+                image_data = detect_crop_face(frame)
             send_response(client_socket, image_data, "Success")
             logging.info("Image capture request received.")
         else:
@@ -181,8 +191,10 @@ def send_response(client_socket, image_data, status):
             encoded_image = base64.b64encode(image_data).decode()
             response_dict["image"] = encoded_image
         response_json = json.dumps(response_dict)
+        
         response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\n\r\n{response_json}"
         client_socket.sendall(response.encode())
+        
     except Exception as e:
         logging.error("Error sending response: %s", e)
       
