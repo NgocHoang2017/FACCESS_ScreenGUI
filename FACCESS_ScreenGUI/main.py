@@ -4,17 +4,18 @@ import numpy as np
 import threading
 import logging
 import serial
-from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget, QDesktopWidget, QMessageBox
+from PyQt5.QtWidgets import QApplication, QVBoxLayout, QWidget, QDesktopWidget, QMessageBox,QLabel
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import QTimer, Qt
 import sqlite3
 from datetime import datetime
 import socket
+import json
+import base64
 from urllib.parse import urlparse, parse_qs
-
+from log import setup_logging
 # Setup logging
-#logging.basicConfig(level=logging.DEBUG)
-logging.basicConfig(filename='app.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+setup_logging()
 # Load the haarcascade for face detection
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
@@ -24,7 +25,6 @@ CMD_DETECT_OBJ = 0x10
 class CameraWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        super().__init__(parent)
         self.setWindowTitle("Camera Widget")
         self.resize(800, 600)  
         self.center_on_screen()
@@ -32,9 +32,8 @@ class CameraWidget(QWidget):
         self.image_label = QLabel(self)
         self.image_label.setAlignment(Qt.AlignCenter)
 
-        self.layout = QVBoxLayout()
+        self.layout = QVBoxLayout(self)
         self.layout.addWidget(self.image_label)
-        self.setLayout(self.layout)
 
         # Initialize the camera
         self.capture = cv2.VideoCapture(1)
@@ -42,7 +41,7 @@ class CameraWidget(QWidget):
         # Create a timer for updating the camera stream
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
-        self.timer.start(int(1000/15))  # 15 fpf
+        self.timer.start(int(1000/15))
         
         # Flag for capturing image
         self.capture_image = False
@@ -56,14 +55,14 @@ class CameraWidget(QWidget):
         self.move(center_point - self.rect().center())
 
     def update_frame(self):
+        global frame
         try:
             ret, frame = self.capture.read()
             if ret:
                 # Convert from OpenCV image to QImage
                 rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                q_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                q_image = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
                 pixmap = QPixmap.fromImage(q_image)
                 # Display the image on label
                 self.image_label.setPixmap(pixmap)
@@ -83,16 +82,12 @@ class CameraWidget(QWidget):
 
 def serial_reader():
     # Open the serial port
-    with serial.Serial('/dev/ttyAML1', 115200, timeout=1) as ser:
+    with serial.Serial('/dev/ttyAML1', 115200, timeout=0.1) as ser:
         while True:
             data = ser.readline()
-            if data:
-                # Process the received data from the serial port
-                logging.debug("Data from serial: %s", data)
-                if data[2] == CMD_DETECT_OBJ:
-                    camera_widget.capture_image = True
-                    send_serial_response(ser,0x00)
-                    
+            if data and data[2] == CMD_DETECT_OBJ:
+                camera_widget.capture_image = True
+                send_serial_response(ser, 0x00)
 
 def send_serial_response(ser, message):
     """Send a response to the serial port."""
@@ -116,8 +111,7 @@ def capture_and_save_image(frame):
         x, y, w, h = nearest_face
         
         # Crop and resize the face
-        cropped_face = frame[y:y+h, x:x+w]
-        cropped_face = cv2.resize(cropped_face, (300, 400))
+        cropped_face = cv2.resize(frame[y:y+h, x:x+w], (300, 400))
         
         # Convert to binary
         _, buffer = cv2.imencode('.jpg', cropped_face)
@@ -127,28 +121,25 @@ def capture_and_save_image(frame):
         try:
             conn = sqlite3.connect('face.db')
             cursor = conn.cursor()
-            now = datetime.now()
-            date_time = now.strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute("INSERT INTO Images (Date, Time, Image) VALUES (?, ?, ?)", (date_time, date_time, sqlite3.Binary(binary_image)))
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("INSERT INTO Images (Date, Time, Image) VALUES (?, ?, ?)", (now, now, sqlite3.Binary(binary_image)))
             conn.commit()
-            logging.debug("Image inserted database successfully!")
-            show_message_box("Success", "Capture image successfully")
+            logging.debug("Image inserted into database successfully!")
+            show_message_box("Success", "Image captured successfully")
         except sqlite3.Error as e:
-            logging.error("Error inserting image to database: %s", e)
-            show_message_box("Error", "Error")
+            logging.error("Error inserting image into database: %s", e)
+            show_message_box("Error", "Error capturing image")
         finally:
             if conn:
                 conn.close()
     else:
         logging.warning("No face detected!")
 
-
 def show_message_box(title, message, icon=QMessageBox.Information):
     msg = QMessageBox()
     msg.setWindowTitle(title)
     msg.setText(message)
     msg.setIcon(icon)
-
     QTimer.singleShot(1000, msg.close)
     msg.exec_()
 
@@ -166,20 +157,31 @@ def process_request(request, client_socket):
         if capture_value == 'capture':
             # Call a function to handle the capture process
             camera_widget.capture_image = True
-            send_response(client_socket, "Success")
+            image_data = None
+            if frame is not None:
+                image_data = cv2.imencode('.jpg', frame)[1].tobytes()
+            send_response(client_socket, image_data, "Success")
             logging.info("Image capture request received.")
         else:
-            send_response(client_socket, "Error")
+            send_response(client_socket, None, "Error")
             logging.warning("Invalid command.")
     else:
-        send_response(client_socket, "Error")
-        logging.error("Unavalble message.")  
-    
+        send_response(client_socket, None, "Error")
+        logging.error("Unavailable message.")  
 
-def send_response(client_socket, message):
-    """Send a response to the client with the given message."""
+def send_response(client_socket, image_data, status):
+    """Send a response to the client."""
     try:
-        response = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {len(message)}\r\n\r\n{message}"
+        if client_socket is None or not isinstance(client_socket, socket.socket):
+            logging.error("Invalid client socket.")
+            return
+
+        response_dict = {"status": status}
+        if image_data is not None:
+            encoded_image = base64.b64encode(image_data).decode()
+            response_dict["image"] = encoded_image
+        response_json = json.dumps(response_dict)
+        response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\n\r\n{response_json}"
         client_socket.sendall(response.encode())
     except Exception as e:
         logging.error("Error sending response: %s", e)
@@ -187,13 +189,12 @@ def send_response(client_socket, message):
 def start_server():
     """Start the socket server and listen for incoming connections."""
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_address = ('192.168.1.140', 8000)
+    server_address = ('0.0.0.0', 8000)
     server_socket.bind(server_address)
     server_socket.listen(1)
     
     server_address = server_socket.getsockname()
     logging.info("Server address: %s:%s", server_address[0], server_address[1])
-    
     
     while True:
         client_socket, client_address = server_socket.accept()
@@ -206,8 +207,6 @@ def start_server():
         finally:
             client_socket.close()
             logging.info("Connection closed.")
-
-
 
 def main():
     # Create threads for serial port and socket server
